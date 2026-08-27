@@ -1,0 +1,83 @@
+name: Bootstrap Build CommonwealthVendettas
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'bootstrap/source.part*'
+      - '.github/workflows/bootstrap-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout bootstrap repository
+        uses: actions/checkout@v4
+
+      - name: Restore canonical v0.4 source
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = Get-ChildItem -Path 'bootstrap\source.part*' | Sort-Object Name
+          if ($parts.Count -ne 9) { throw "Expected 9 source parts, found $($parts.Count)." }
+          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          [IO.File]::WriteAllBytes('source.zip', [Convert]::FromBase64String($b64))
+          New-Item -ItemType Directory -Force -Path 'restored' | Out-Null
+          Expand-Archive -Path 'source.zip' -DestinationPath 'restored' -Force
+          if (-not (Test-Path 'restored\xmake.lua')) { throw 'xmake.lua missing after restore.' }
+          if (-not (Test-Path 'restored\src\core\SurvivalEngine.cpp')) { throw 'SurvivalEngine.cpp missing after restore.' }
+          Write-Host 'Canonical source restored successfully.'
+
+      - name: Setup Xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Prepare CommonLibF4 and Prisma SDK
+        shell: powershell
+        working-directory: restored
+        run: .\bootstrap-deps.ps1
+
+      - name: Configure release x64
+        shell: powershell
+        working-directory: restored
+        run: xmake f -c -p windows -a x64 -m release -y -vD
+
+      - name: Build F4SE plugin
+        shell: powershell
+        working-directory: restored
+        run: xmake -y -vD
+
+      - name: Run portable core tests
+        shell: powershell
+        working-directory: restored
+        run: |
+          cmake -S . -B cmake-build -DCV_BUILD_PLUGIN=OFF
+          cmake --build cmake-build --config Release
+          ctest --test-dir cmake-build -C Release --output-on-failure
+
+      - name: Package installable mod
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Get-ChildItem -Path 'restored\build' -Recurse -Filter 'CommonwealthVendettas.dll' | Select-Object -First 1
+          if (-not $dll) { throw 'CommonwealthVendettas.dll not found after build.' }
+          New-Item -ItemType Directory -Force -Path 'artifact\Data\F4SE\Plugins' | Out-Null
+          Copy-Item $dll.FullName 'artifact\Data\F4SE\Plugins\CommonwealthVendettas.dll'
+          Copy-Item 'restored\Data\F4SE\Plugins\CommonwealthVendettas' 'artifact\Data\F4SE\Plugins\CommonwealthVendettas' -Recurse
+          Copy-Item 'restored\Data\PrismaUI_F4' 'artifact\Data\PrismaUI_F4' -Recurse
+          Copy-Item 'restored\CommonwealthVendettas_INSTRUCOES.txt' 'artifact\CommonwealthVendettas_INSTRUCOES.txt'
+          Compress-Archive -Path 'artifact\*' -DestinationPath 'CommonwealthVendettas_v0.4-dev.zip' -Force
+          Get-FileHash 'CommonwealthVendettas_v0.4-dev.zip' -Algorithm SHA256 | Format-List
+
+      - name: Upload installable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: CommonwealthVendettas-v0.4-dev
+          path: CommonwealthVendettas_v0.4-dev.zip
+          if-no-files-found: error
